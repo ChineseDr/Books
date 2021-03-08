@@ -1,0 +1,402 @@
+## 打开Camera
+
+本节我们主要研究打开相机的流程，考虑到api2主要通过设置回调的方式进行操作，我们会探究设置的回
+调是如何被调用的。 
+
+frameworks/base/core/java/android/hardware/camera2
+
+frameworks/av/services/camera/libcameraservice
+
+hardware/interfaces/camera
+
+###  1. java层
+
+通过获取系统服务，即getSystemService(Context.CAMERA_SERVICE)的方式获取CameraManager，apk
+调用该类的openCamera方法打开相机，代码在CameraManager.java： 
+
+```java
+openCamera()==>openCameraForUid()==>openCameraDeviceUserAsync();
+```
+
+在连续2个函数调用后，调用openCameraDeviceUserAsync，
+
+```java
+openCameraDeviceUserAsync(){
+  /*①*/ICameraService cameraService = CameraManagerGlobal.get().getCameraService();
+  /*②*/cameraUser = cameraService.connectDevice(callbacks, cameraId,mContext.getOpPackageName(), uid);
+  /*③*/deviceImpl.setRemoteDevice(cameraUser);
+  device = deviceImpl;
+  return device;
+}
+```
+
+①这里首先关注ICameraService，它是通过AIDL获取的native C++层的CameraService对象，代码在
+CameraManager.java
+
+```java
+public ICameraService getCameraService()==>connectCameraServiceLocked(){cameraServiceBinder.linkToDeath(this, /*flags*/ 0);}
+```
+
+这里对于native java而言，通过linkToDeath获得了远端CameraService的代理对象。
+
+②下一步，通过ICameraService.connectDevice获取ICameraDeviceUser，它定义在ICameraService.aidl
+中。 
+
+③最后，通过CameraDeviceImpl.setRemoteDevice将java层的相机对象与远端的相机对象进行连接，代码
+如下： 
+
+```java
+CameraDeviceImpl.setRemoteDevice(){
+  remoteDeviceBinder.linkToDeath(this, /*flag*/ 0);
+  mDeviceHandler.post(mCallOnOpened);
+  mDeviceHandler.post(mCallOnUnconfigured);
+}
+```
+
+这里仍然通过linkToDeath获得远端CameraDevice的代理对象，在连接成功后，回调mCallOnOpened通
+知上层，相机已经打开。
+
+```jav
+private final Runnable mCallOnOpened;
+```
+
+这里的mDeviceCallback就是我们在openCamera时传入的CameraDevice.StateCallback，初始化等逻辑
+比较简单。
+这几步AIDL相关分析见下面的native C++层分析 
+
+### 2. native C++
+
+首先分析前面提到的AIDL调用
+
+以ICameraService为例进行说明。
+server端：系统启动执行cameraserver.rc -> main_cameraserver.cpp的main方法
+
+```c++
+main(){CameraService::instantiate();}
+```
+
+CameraService继承了BinderService.cpp这个模板类，调用它的instantiate就是调用父类的instantiate方法
+
+```C++
+instantiate()==>publish()==>addService()
+```
+
+通过publish方法注册了对应的service，其名字由子类的getServiceName方法定义，CameraService定义在
+CameraService.h中 
+
+```c++
+static char const* getServiceName() { return "media.camera"; }
+```
+
+至此，server端的服务注册成功。
+AIDL：定义在ICameraService.aidl中，定义了client端所需要的能力，比如上面java侧调用的connectDevice方法。
+Client端：以上所示，通过调用ServiceManager.getService(CAMERA_SERVICE_BINDER_NAME)和
+linkToDeath获取对应的服务，可以看到service名字的定义在CameraManager的内部类
+CameraManagerGlobal中，是和server端名字吻合的
+
+```java
+private static final String CAMERA_SERVICE_BINDER_NAME = "media.camera";
+```
+
+回顾②，在获取CameraService后，调用connectDevice获取ICameraDeviceUser，代码在
+CameraService.cpp
+
+```C++
+CameraService::connectDevice(){
+  ret = connectHelper<hardware::camera2::ICameraDeviceCallbacks,CameraDeviceClient>();
+}
+```
+
+可以看到我们常见的日志CameraService::connectDevice E，这里E表示打开相机，是Enter的首字母。
+随后调用connectHelper打开相机
+
+```java
+CameraService::connectHelper()
+```
+
+此函数进行了很多的检查，比如我们常见的相机被占用，日志为
+CameraService::connect (PID %d) rejected (too many other clients connecting) 
+
+在连接过程中，首先调用makeClient
+
+```java
+CameraService::makeClient(){*client = new CameraDeviceClient()}
+```
+
+根据hal版本，创建了CameraDeviceClient返回给上一级，根据前面分析的，对于
+ICameraDeviceUser，其在native C++层对应的类就是CameraDeviceClient，它是native C++层提供给
+java层的远端代理，构造逻辑如下：CameraDeviceClient() -> Camera2ClientBase() -> new
+Camera3Device()
+这里通过连续的构造引出了native C++层的核心类，Camera3Device，暂且记下。
+
+```c++
+CameraDeviceClient::initialize()==> CameraDeviceClient::initializeImpl()==>Camera2ClientBase::initialize()
+```
+
+ CameraDeviceClient继承自Camera2ClientBase，调用Camera2ClientBase的initialize，代码在Camera2ClientBase.cpp 
+
+```c++
+Camera2ClientBase::initialize()==> Camera2ClientBase<TClientBase>::initializeImpl(){
+  res = mDevice->initialize(providerPtr, monitorTags);
+}
+```
+
+在这里最终调到了前述的核心类，Camera3Device的initialize方法，代码在Camera3Device.cpp
+
+```c++
+Camera3Device::initialize(){
+  status_t res = manager->openSession(mId.string(), this,&session);//①
+  mInterface = new HalInterface(session, queue);
+}
+```
+
+这里出现一个新类HalInterface，并用返回的session初识化它，并将其设置给成员mInterface。后面分析
+
+同时引入新类CameraProviderManager，并调用它的openSession方法，那么他是什么产生的呢，前面分析AIDL时，其中提到将CameraService作为服务端注册到系统服务中，随后通过ICameraService的getService方法会触发对应service的onFirstRef方法（sp，wp等职能指针在首次饮用时进行的初始化），代码在CameraSevice
+
+```c++
+CameraService::onFirstRef()==>CameraService::enumerateProviders(){
+  mCameraProviderManager = new CameraProviderManager();
+}
+```
+
+ 在这里构造了CameraProviderManager，它是管理hal层相机设备的工具,在CameraProviderManager.cpp
+
+```c++
+const std::string kLegacyProviderName("legacy/0");
+CameraProviderManager::initialize(wp<CameraProviderManager::StatusListener> listener,
+                                  ServiceInteractionProxy* proxy){
+ 	mListener = listener;
+	mServiceProxy = proxy;
+    bool success = mServiceProxy->registerForNotifications(this);
+  	addProviderLocked(kLegacyProviderName, false);
+}
+```
+
+CameraProviderManager::initialize函数第二参数ServiceInteractionProxy是默认参数，定义在CameraProviderManager.h中
+
+```c++
+struct ServiceInteractionProxy{}
+struct HardwareServiceInteractionProxy : public ServiceInteractionProxy {}
+static HardwareServiceInteractionProxy sHardwareServiceInteractionProxy;
+status_t initialize(wp<StatusListener> listener,
+  ServiceInteractionProxy *proxy = &sHardwareServiceInteractionProxy);
+```
+
+继续回到CameraProviderManager::initialize函数的实现，最终调用的addProviderLocked这个函数，这个函数用于将hal层设备添加的navtive中，
+
+```c++
+CameraProviderManager::addProviderLocked(){
+  interface = mServiceProxy->getService(newProvider);
+  
+}
+```
+
+首先看mServiceProxy->getService，这个mServiceProxy就是上面所说的HardwareServiceInteractionProxy；所以getsevice就是调用的就是ICameraProvider.getService,这是一个HIDL调用，返回hal层的camera信息，集ICameraProvider，再封装ProviderInfo并加入列表mProviders中待用，CameraProviderManager.cpp
+
+```c++
+status_t CameraProviderManager::ProviderInfo::initialize() {
+	hardware::Return<bool> linked = mInterface->linkToDeath(this, mId);
+	std::vector<std::string> devices;	
+	hardware::Return<void> ret = mInterface->getCameraIdList();
+  	status_t res = addDevice(device,
+                hardware::camera::common::V1_0::CameraDeviceStatus::PRESENT, &id);
+}
+```
+
+这里的mInterface就是通过getService返回的hal对象，即ICameraProvider，同样也是通过linkToDeath来连接，随后获取相机设备信息，通过addaddDevice函数，添加到DeviceInfo的mDevices成员中，CameraProviderManager.cpp
+
+```c++
+status_t CameraProviderManager::ProviderInfo::addDevice(){
+  case 3:
+	deviceInfo = initializeDeviceInfo<DeviceInfo3>(name, mProviderTagid,
+			id, minor);
+}
+```
+
+根据hal版本，通过initializeDeviceInfo初始化DeviceInfo3，CameraProviderManager.cpp
+
+```c++
+CameraProviderManager::ProviderInfo::initializeDeviceInfo(){
+  auto cameraInterface = getDeviceInterface<typename DeviceInfoT::InterfaceT>(name);
+}
+
+template<>
+sp<device::V3_2::ICameraDevice>
+CameraProviderManager::ProviderInfo::getDeviceInterface
+	<device::V3_2::ICameraDevice>(const std::string &name) const {
+	//一个lambda表达式
+	ret = mInterface->getCameraDeviceInterface_V3_x(name, [&status, &cameraInterface](
+        Status s, sp<device::V3_2::ICameraDevice> interface) {
+                status = s;
+                cameraInterface = interface;
+            });
+     return cameraInterface;
+}
+```
+
+在连续调用之后通过ICameraProvide->getCameraDeviceInterface_V3_x获取hal相机对象，其类型为ICameraDevice，这里还是HIDL调用，最终将返回的ICameraDevice设置给DeviceInfo3(DeviceInfoT)的mInterface，
+
+HIDL调用细节不展开，在hal流程
+
+下面回到Camera3Device::initialize，可以看到①调用了CameraProviderManager.openSession函数，这个
+
+函数根据版本有多个实现，我们关注V3_2版本
+
+```c++
+CameraProviderManager::openSession(const std::string &id,){
+   auto deviceInfo = findDeviceInfoLocked(id, {3,0},{4,0});
+   ret = deviceInfo3->mInterface->open(callback, [&status, &session]
+   			(Status s, const sp<device::V3_2::ICameraDeviceSession>& cameraSession) {
+             	status = s;
+                if (status == Status::OK) {
+                    *session = cameraSession;
+                }
+            });
+}
+```
+
+findDeviceInfoLocked通过遍历我们之前生成的ProviderInfo列表，找到合适的对象，调用它的mInterface->open函数，根据上下文描述，这个mInterface就是ICameraDevice，因此从下面开始，进入hal层流程分析，
+
+在open时设置了个ICameraDeviceSession对象，这个在预览是用到再分析
+
+### 3. hal层流程
+
+首先分析几个HIDL调用
+
+ICameraProvider
+
+server端：系统启动执行android.hardware.camera.provider@2.4-service.rc，调用到Service.cpp中的
+main函数
+
+在main函数中执行defaultPassthroughServiceImplementation创建默认为直通模式（passthrough）的
+CameraProvider 服务实现，它定义在 LegacySupport.h中。
+
+HIDL：定义在ICameraProvider.hal中，定义client端需要的能力，比如前面提到的
+getCameraDeviceInterface_V3_x。 
+
+client端：如前面所示，通过mServiceProxy->getService和linkToDeath连接获取对应的服务，调用
+getService获取服务时，在ServiceManagement.cpp的PassthroughServiceManager中，动态查找符号，
+规则为：const std::string sym = "HIDL_FETCH_" + ifaceName; 
+
+打开相机时，实际调用的是ICameraDevice的open方法，
+
+```c++
+CameraDevice::open(const sp<ICameraDeviceCallback>& callback, open_cb _hidl_cb)  {
+	res = mModule->open(mCameraId.c_str(),reinterpret_cast<hw_device_t**>(&device));//①
+	session = new CameraDeviceSession(device, info.static_camera_characteristics, callback);
+	mSession = session;
+}
+```
+
+session相关内容先跳过，先关注mModule->open()，这里是调用了CameraModule的open方法，可以看到该成员在CameraDevice构造时作为参数传入的，那么他是什么时候生成的呢
+
+如前述分析HIDL流程时分析，在getservice时，会动态查找符号，对于相机其符号名是：HIDL_FETCH_ICameraProvider，定义在CameraProvider.cpp中
+
+```c++
+ICameraProvider* HIDL_FETCH_ICameraProvider(const char* name) {
+	CameraProvider* provider = new CameraProvider();
+	return provider;
+}
+```
+
+接下来构造CameraProvider的时候，会直接调用CameraProvider的initialize方法，
+
+```c++
+bool CameraProvider::initialize(){
+	int err = hw_get_module(CAMERA_HARDWARE_MODULE_ID,(const hw_module_t **)&rawModule);
+	mModule = new CameraModule(rawModule);
+	err = mModule->init();
+	err = mModule->setCallbacks(this);
+}
+```
+
+可见是调用了hw_get_module,获取camera_module_t,并在后续对它进行初始化，这个对象定义在camera_common.h中,
+
+```c++
+typedef struct camera_module {
+    hw_module_t common;
+    int (*get_number_of_cameras)(void);
+    int (*get_camera_info)(int camera_id, struct camera_info *info);
+    int (*set_callbacks)(const camera_module_callbacks_t *callbacks);
+    void (*get_vendor_tag_ops)(vendor_tag_ops_t* ops);
+    int (*open_legacy)(const struct hw_module_t* module, const char* id,
+            uint32_t halVersion, struct hw_device_t** device);
+    int (*set_torch_mode)(const char* camera_id, bool enabled);
+    int (*init)();
+    void* reserved[5];
+} camera_module_t;
+```
+
+具体实现是在hardware/libhardware/modules/camera/3_0/CameraHAL.cpp
+
+```c++
+static int open_dev(const hw_module_t* mod, const char* name, hw_device_t** dev)
+{
+    return gCameraHAL.open(mod, name, dev);
+}
+
+static hw_module_methods_t gCameraModuleMethods = {
+    .open = open_dev
+};
+
+camera_module_t HAL_MODULE_INFO_SYM __attribute__ ((visibility("default"))) = {
+    .common = {
+        .tag                = HARDWARE_MODULE_TAG,
+        .module_api_version = CAMERA_MODULE_API_VERSION_2_2,
+        .hal_api_version    = HARDWARE_HAL_API_VERSION,
+        .id                 = CAMERA_HARDWARE_MODULE_ID,
+        .name               = "Default Camera HAL",
+        .author             = "The Android Open Source Project",
+        .methods            = &gCameraModuleMethods,
+        .dso                = NULL,
+        .reserved           = {0},
+    },
+    .get_number_of_cameras = get_number_of_cameras,
+    .get_camera_info       = get_camera_info,
+    .set_callbacks         = set_callbacks,
+    .get_vendor_tag_ops    = get_vendor_tag_ops,
+    .open_legacy           = NULL,
+    .set_torch_mode        = NULL,
+    .init                  = NULL,
+    .reserved              = {0},
+};
+```
+
+
+
+回到①那么调用CameraModule的open方法就是调用open_dev方法，继续调用到CameraHAL.open方法
+
+```c++
+static CameraHAL gCameraHAL(2);
+int CameraHAL::open(const hw_module_t* mod, const char* name, hw_device_t** dev)
+{
+	id = strtol(name, &nameEnd, 10);
+	return mCameras[id]->open(mod, dev);
+}
+```
+
+然后调用hardware/libhardware/modules/camera/3_0/Camera.cpp的open，这里各厂家会自己实现
+
+```c++
+int Camera::open(const hw_module_t *module, hw_device_t **device)
+{
+  // TODO: open camera dev nodes, etc
+    mBusy = true;
+    mDevice.common.module = const_cast<hw_module_t*>(module);
+    *device = &mDevice.common;
+    return 0;
+}
+```
+
+经过连续调用，最终通过linux系统调用打开相机，至此从apk到native层再到hal层全部流程
+
+### 总结
+
+通过整个openCamera的过程可以发现，其本质就是通过一层层调用，获取底层相机设备的代理对象，并对其进行open操作
+
+通过分析，在openCamera中可能出现的错误有
+
+1. cameraService未启动：包括native和hal层两部分，都需要在开机时启动相机服务，如果服务有问题，相机业务失败
+2. 无可用相机设备：由于上层获取的相机代理都是由底层返回的，如果底层不能给出正确的设备列表，则相机业务失败。
+3. open失败：有较多分支 会触发打开失败，比如持锁，状态错误，当前相机已被其他应用连接。
