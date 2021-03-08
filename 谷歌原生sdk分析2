@@ -1,0 +1,419 @@
+## 预览
+
+预览涉及到几个核心概念:request,stream,buffer,surface等，预览会分析它们的关系，高清楚它们是如何写作的，最终显示出预览
+
+预览的逻辑流程相比预览复杂的多，按照时间处理顺序
+
+1. 从TextureView经过几步生成Surface
+2. 调用CameraDevice.createCaptureRequest创建request
+3. 调用CameraDevice.createCaptureSession创建session
+4. 在创建session的回调onConfigured中调用返回的CameraCaptureSession的setRepeatRequest设置刚刚创建的request
+
+先分析主干流程，分支流程需要时在分析
+
+### 1.创建Session和stream
+
+#### 1.1 native java 
+
+从cameraDevice.createCaptureSession开始分析，这个是个抽象方法，正如前面分析openCamera时cameraDevice对应的是cameraDeviceImpl
+
+```java
+    public void createCaptureSession(List<Surface> outputs,
+            CameraCaptureSession.StateCallback callback, Handler handler)
+            throws CameraAccessException {
+        List<OutputConfiguration> outConfigurations = new ArrayList<>(outputs.size());
+        for (Surface surface : outputs) {
+            outConfigurations.add(new OutputConfiguration(surface));
+        }
+        createCaptureSessionInternal(null, outConfigurations, callback, handler,
+                /*operatingMode*/ICameraDeviceUser.NORMAL_MODE);
+    }
+```
+
+传入参数：
+
+* outputs：传入的surface列表，比如对于APIdemo而言，是用于显示preview的，从TextureView生成的surface，以及用于拍照的，从ImageReader生成的surface 
+* CameraCaptureSession.StateCallback：用户定义的回调，用于感知session状态变化，比如
+  onConfigured等 
+* handler：传入的线程，在操作时保证在同一线程操作 
+
+在createCaptureSession中，将Surface封装成OutputConfiguration，作为参数调用createCaptureSessionInternal
+
+```java
+private void createCaptureSessionInternal(InputConfiguration inputConfig,
+            List<OutputConfiguration> outputConfigurations,
+            CameraCaptureSession.StateCallback callback, Handler handler,
+                                          int operatingMode) throws CameraAccessException {
+	configureSuccess = configureStreamsChecked(inputConfig, outputConfigurations, 										operatingMode);
+  	//
+  	CameraCaptureSessionCore newSession = null;
+	newSession = new CameraCaptureSessionImpl(mNextSessionId++, input,
+					callback, handler, this, mDeviceHandler,
+					configureSuccess);
+}
+```
+
+需要注意的是这里调用时，传入的inputConfig是空 
+
+接下来看一下，根据封装的OutputConfiguration列表，调用configureStreamsChecked配置流
+
+```java
+public boolean configureStreamsChecked(InputConfiguration inputConfig,
+            List<OutputConfiguration> outputs, int operatingMode){
+	mRemoteDevice.beginConfigure();
+	int streamId = mRemoteDevice.createStream(outConfig);
+	mRemoteDevice.endConfigure(operatingMode);
+}
+```
+
+主要行为有beginConfigure，createStream以及endConfigure，这里的mRemoteDevice前面分析打开相机时知道是对代理对象操作的封装类ICameraDeviceUserWrapper ，因此实际就是在调用代理对象ICameraDeviceUser的对应3个方法 。
+
+需要注意的是注意这里对于每一个OutputConfiguration，即surface，都创建了一个stream，它通过AIDL定义从java传递到C++层。 
+
+这里再向下进入native C++流程，我们先回过头看createCaptureSessionInternal在configureStreamsChecked配置完成后的行为，从代码可以看到，它接下创建了CameraCaptureSessionImpl对象，这个类的构造方法在
+CameraCaptureSessionImpl.java： 
+
+```java
+CameraCaptureSessionImpl(int id, Surface input,
+            CameraCaptureSession.StateCallback callback, Handler stateHandler,
+            android.hardware.camera2.impl.CameraDeviceImpl deviceImpl,
+                         Handler deviceStateHandler, boolean configureSuccess) {
+	mStateCallback = createUserStateCallbackProxy(mStateHandler, callback);
+	if (configureSuccess) {
+		mStateCallback.onConfigured(this);
+	} else {
+		mStateCallback.onConfigureFailed(this);
+	}
+}
+```
+
+这里createUserStateCallbackProxy将传入的回调做了一些封装处理，没有逻辑变动，随后根据配置流的
+结果，回调apk传入的接口onConfigured或onConfigureFailed，后面的逻辑放在后面继续分析，下面
+先进入native C++ 
+
+#### 1.2 native C++
+
+上面提到native java实际是调用了ICameraDeviceUser的beginConfigure，createStream以及
+endConfigure，根据前面AIDL相关知识，这里对应的类是CameraDeviceClient，其对应函数实现为： 
+
+```c++
+binder::Status CameraDeviceClient::beginConfigure() {
+	return binder::Status::ok();
+}
+
+binder::Status CameraDeviceClient::createStream(
+  			const hardware::camera2::params::OutputConfiguration &outputConfiguration,
+			int32_t* newStreamId) {
+	const std::vector<sp<IGraphicBufferProducer>>& bufferProducers = 									outputConfiguration.getGraphicBufferProducers();//①  
+	OutputStreamInfo streamInfo;
+	bool isStreamInfoValid = false;
+  	for (auto& bufferProducer : bufferProducers) {//②
+		sp<Surface> surface;
+		res = createSurfaceFromGbp(streamInfo, isStreamInfoValid, surface, bufferProducer);
+    }
+	int streamId = camera3::CAMERA3_STREAM_ID_INVALID;
+    err = mDevice->createStream(surfaces, deferredConsumer, streamInfo.width,
+			streamInfo.height, streamInfo.format, streamInfo.dataSpace,
+			static_cast<camera3_stream_rotation_t>(outputConfiguration.getRotation()),
+			&streamId, outputConfiguration.getSurfaceSetID(), isShared);
+}
+
+binder::Status CameraDeviceClient::endConfigure(int operatingMode) {
+	status_t err = mDevice->configureStreams(operatingMode);
+}
+
+```
+
+beginConfigure基本上什么都没做，先分析createStream，surface和stream都是预览流程的核心，这里就是创建native C++层surface和stream的位置
+
+如框架图所示，创建TextureView用于显示，再从中获取SurfaceTexture,最后用SurfaceTexture生成Surface，构造方法在Surface中
+
+```java
+public Surface(SurfaceTexture surfaceTexture) {
+	synchronized (mLock) {
+		setNativeObjectLocked(nativeCreateFromSurfaceTexture(surfaceTexture));
+	}
+}
+private void setNativeObjectLocked(long ptr) {
+	if (mNativeObject != ptr) {
+		mNativeObject = ptr;
+	}
+}
+```
+
+这里通过调用nativeCreateFromSurfaceTexture，生成了native C++的对象，赋值给成员 mNativeObject，这个方法通过JNI进行调用，对应的native方法定义在android_view_Surface.cpp
+
+```c++
+static jlong nativeCreateFromSurfaceTexture(JNIEnv* env, jclass clazz,
+                                            jobject surfaceTextureObj) {
+  sp<IGraphicBufferProducer> producer(SurfaceTexture_getProducer(env, surfaceTextureObj));
+  sp<Surface> surface(new Surface(producer, true));
+}
+```
+
+新建Surface时将producer设置为成员，实现在Surface.cpp
+
+```c++
+Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controlledByApp)
+   : mGraphicBufferProducer(bufferProducer),{}
+```
+
+SurfaceTexture_getProducer定义在SurfaceTexture.cpp中
+
+```c++
+sp<IGraphicBufferProducer> SurfaceTexture_getProducer(JNIEnv* env, jobject thiz) {
+    return (IGraphicBufferProducer*)env->GetLongField(thiz, fields.producer);
+}
+```
+
+从中可以看出IGraphicBufferProducer实际时Surfacetexture的成员，用它做参数构造了native C++层的Surface对象，并返回给native java层作为mNativeObject持有。
+
+接下回到① createStream的outputConfiguration.getGraphicBufferProducers调用，这里的outputConfiguration是由native java侧创建而来的
+
+```java
+new OutputConfiguration(surface)
+```
+
+这个对象经过OutputConfiguration.aidl封装，传递到native C++侧，传递过程分别在OutputConfiguration.java
+
+```java
+ public void writeToParcel(Parcel dest, int flags) {dest.writeTypedList(mSurfaces);}
+```
+
+和OutputConfiguration.cpp
+
+```c++
+status_t OutputConfiguration::readFromParcel(const android::Parcel* parcel) {
+	for (auto& surface : surfaceShims) {
+		mGbps.push_back(surface.graphicBufferProducer);
+	}
+}
+```
+
+这里Surface进行序列化时，会调用它自己的writeToParcel，代码在Surface.java
+
+```java
+public void writeToParcel(Parcel dest, int flags) {
+  synchronized (mLock) {
+    nativeWriteToParcel(mNativeObject, dest);
+  }
+}
+```
+
+native调用如前述，在android_view_Surface.cpp
+
+```c++
+static void nativeWriteToParcel(JNIEnv* env, jclass clazz,
+                                jlong nativeObject, jobject parcelObj) {
+	sp<Surface> self(reinterpret_cast<Surface *>(nativeObject));
+	android::view::Surface surfaceShim;
+	if (self != nullptr) {
+		surfaceShim.graphicBufferProducer = self->getIGraphicBufferProducer();
+	}
+	surfaceShim.writeToParcel(parcel, /*nameAlreadyWritten*/true);
+}
+```
+
+最后调用android::view::Surface  的序列化方法，在android::view::Surface.cpp，注意序列化的Surface是一个单独的类frameworks/native/libs/gui/view/Surface.cpp
+
+```c++
+status_t Surface::writeToParcel(Parcel* parcel, bool nameAlreadyWritten) const {
+  return IGraphicBufferProducer::exportToParcel(graphicBufferProducer, parcel);
+}
+//8.0是，9.0拆分了调用
+//res = parcel->writeStrongBinder(IGraphicBufferProducer::asBinder(graphicBufferProducer));
+status_t IGraphicBufferProducer::exportToParcel(const sp<IGraphicBufferProducer>& producer,
+                                                Parcel* parcel) {
+	return producer->exportToParcel(parcel);
+}
+
+status_t IGraphicBufferProducer::exportToParcel(Parcel* parcel) {
+  return parcel->writeStrongBinder(IInterface::asBinder(this));
+}
+```
+
+可以看到，在Surface进行封装，传递的过程中，实际上我们只将它对应的IGraphicBuàerProducer进行了
+传递 。
+
+接下来回到createStream ②，这里一般bufferProducers中只包含一个gbp，根据它创建native的surface。考虑到传入的isStreamInfoValid总是false，还会设置streamInfo相关的数据，createSurfaceFromGbp的实现
+
+frameworks/av/services/camera/libcameraservice/api2/CameraDeviceClient.cpp
+
+```c++
+binder::Status CameraDeviceClient::createSurfaceFromGbp(
+        OutputStreamInfo& streamInfo, bool isStreamInfoValid,
+  sp<Surface>& surface, const sp<IGraphicBufferProducer>& gbp) {
+	surface = new Surface(gbp, useAsync);
+	ANativeWindow *anw = surface.get();
+	if (!isStreamInfoValid) {
+        streamInfo.width = width;
+        streamInfo.height = height;
+        streamInfo.format = format;
+        streamInfo.dataSpace = dataSpace;
+        streamInfo.consumerUsage = consumerUsage;
+        return binder::Status::ok();
+    }
+}
+```
+
+前面分析surface传递流程中可以看到，其实已经通过jni调用创建了一个native C++层的surface，为什么不直接调用这个surface呢，而是要将IGraphicBufferProducer作为参数传递下来，在重新创建一个Surface呢 ，暂时记下
+
+到这里引入一个新类ANativeWindow，记住这个类后面会用到
+
+执行完createSurfaceFromGbp后，会调用mDevice->createStream，根据前面打开camera的分析mDevice具体实现在frameworks/av/services/camera/libcameraservice/device3/Camera3Device.cpp
+
+```c++
+status_t Camera3Device::createStream(sp<Surface> consumer,){
+  if (format == HAL_PIXEL_FORMAT_BLOB) { 
+    newStream = new Camera3OutputStream(mNextStreamId, consumers[0],
+                width, height, blobBufferSize, format, dataSpace, rotation,
+                mTimestampOffset, physicalCameraId, streamSetId);
+  }else{
+    newStream = new Camera3OutputStream(mNextStreamId, consumers[0],
+                width, height, format, dataSpace, rotation,
+                mTimestampOffset, physicalCameraId, streamSetId);
+  }
+}
+```
+
+这里会根据传入的Surface创建stream，其判断分支是streamInfo.format,对于相机而言，定义在frameworks/base/core/java/android/hardware/camera2/params/StreamConfigurationMap.java取值如下
+
+```java
+    // from system/core/include/system/graphics.h
+    private static final int HAL_PIXEL_FORMAT_BLOB = 0x21;
+    private static final int HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED = 0x22;
+    private static final int HAL_PIXEL_FORMAT_YCbCr_420_888 = 0x23;
+```
+
+分别用于拍照流，预览流，回调流
+
+创建流的构造，有如下继承关系Camera3OutputStream->Camera3IOStreamBase->Camera3Stream->camera3_stream
+
+hardware/libhardware/include/hardware/camera3.h
+
+```c++
+typedef struct camera3_stream {
+	int stream_type;
+	uint32_t width;
+	uint32_t height;
+	int format;
+	uint32_t usage;
+	uint32_t max_buffers;
+	void *priv;
+	android_dataspace_t data_space;
+	int rotation;
+	const char* physical_camera_id;
+	void *reserved[6];
+} camera3_stream_t;
+```
+
+具体细节先不分析，再用到时在分析，先看createStream之后的CameraDeviceClient::endConfigure，在这里会调用mDevice->configureStreams(operatingMode) 完成流配置，实现依然在Camera3Device.cpp
+
+```c++
+status_t Camera3Device::configureStreams(const CameraMetadata& sessionParams, int operatingMode) {
+  return filterParamsAndConfigureLocked(sessionParams, operatingMode);
+}
+status_t Camera3Device::filterParamsAndConfigureLocked(const CameraMetadata& sessionParams,
+                                                       int operatingMode) {
+  return configureStreamsLocked(operatingMode, filteredParams);
+}
+
+status_t Camera3Device::configureStreamsLocked(int operatingMode,
+                    const CameraMetadata& sessionParams, bool notifyRequestThread) {
+  for (size_t i = 0; i < mOutputStreams.size(); i++) {
+	camera3_stream_t *outputStream;
+	outputStream = mOutputStreams.editValueAt(i)->startConfiguration();
+	streams.add(outputStream);
+  }
+  config.streams = streams.editArray();
+  res = mInterface->configureStreams(sessionBuffer, &config, bufferSizes);
+  for (size_t i = 0; i < mOutputStreams.size(); i++) {
+    sp<Camera3OutputStreamInterface> outputStream = mOutputStreams.editValueAt(i);
+        if (outputStream->isConfiguring() && !outputStream->isConsumerConfigurationDeferred()) {
+            res = outputStream->finishConfiguration();
+        }
+  }
+  if (notifyRequestThread) {
+	mRequestThread->configurationComplete(mIsConstrainedHighSpeedConfiguration, sessionParams);
+  }
+}
+```
+
+这里只看OutputStreams，inputStream逻辑是类似的，这里的mOutputStreams就是在createStream时，逐条添加流的列表。到这里已经时native和hal层交互的地方了，mOutputStreams是Camera3OutputStreamInterface类型的，实际在父类Camera3StreamInterface中定义了startConfiguration，在子类Camera3Stream中实现startConfiguration，这几个方法里的mInterface 是什么，在Camera3Device::initialize里给这个变量进行了赋值 ```mInterface = new HalInterface(session, queue);```
+
+接下来依次分析这几个调用具体都做了什么事情
+
+在Camera3Stream.cpp中
+
+```c++
+camera3_stream* Camera3Stream::startConfiguration() {}
+status_t Camera3Stream::finishConfiguration() {res = configureQueueLocked();}
+```
+
+在Camera3Device.cpp
+
+```c++
+status_t Camera3Device::HalInterface::configureStreams(const camera_metadata_t *sessionParams,
+			camera3_stream_configuration *config, const std::vector<uint32_t>& bufferSizes) {
+  //这里开始进入hal层调用，根据hal版本走对应分支
+	auto err = mHidlSession->configureStreams(requestedConfiguration3_2,
+					[&status, &finalConfiguration_3_2]
+					(common::V1_0::Status s, const HalStreamConfiguration& halConfiguration) {
+						finalConfiguration_3_2 = halConfiguration;
+						status = s;
+                });
+}
+```
+
+这里configureStreams已经进入了hal层流程，暂时先不分析，在后面hal分析时再展开，先看finishConfiguration调用的configureQueueLocked，它定义在子类Camera3OutputStream中
+
+```c++
+status_t Camera3OutputStream::configureQueueLocked() {
+	if ((res = configureConsumerQueueLocked()) != OK) {
+		return res;
+	}
+}
+
+status_t Camera3OutputStream::configureConsumerQueueLocked() {
+	res = mConsumer->connect(NATIVE_WINDOW_API_CAMERA,mBufferReleasedListener,true);
+	res = native_window_set_buffer_count(mConsumer.get(),mTotalBufferCount);
+}
+```
+
+这里的两个调用是View系统相关的操作，在view流程是再展开，这里先简要叙述一下作用
+
+mConsumer->connect定义在Surface.cpp：将作为生产者的流与作为消费者的window连接起来 
+
+native_window_set_buffer_count定义在window.h：设置生产者与消费者之间轮转的buàer的数目
+
+#### 1.3 hal层流程
+
+ 前面分析到configureStreams后进入hal层流程，调用了hal的mHidlSession->configureStreams，这是一个HIDL调用，具体对应hal层类为CameraDeviceSession ，它是什么时候创建的呢
+
+前面分析对HalInterface 的设置，在Camera3Device.cpp
+
+mInterface = new HalInterface(session, queue); 
+
+在之前分析时有描述这里对于session的设置，这里的session是CameraProviderManager的
+openSession方法设置的对象，它实际由方法中的deviceInfo3->mInterface->open行进行设置。构造函数
+在CameraDeviceSession.cpp： 
+
+```c++
+
+```
+
+```c++
+Return<void> CameraDeviceSession::configureStreams(
+		const StreamConfiguration& requestedConfiguration,
+  		ICameraDeviceSession::configureStreams_cb _hidl_cb)  {
+	status_t ret = mDevice->ops->configure_streams(mDevice, &stream_list);
+}
+```
+
+调用到camera的configure_streams，
+
+构造buffer显示图像
+
+#### 总结
+
+通过分析session和Stream的流程，发现stream并不是一组buffer，而是用于管理或者说操作buffer的抽象概念
