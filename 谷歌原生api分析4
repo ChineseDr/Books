@@ -1,0 +1,342 @@
+#### 3.3 view系统
+
+对前面的预览流程做个大致总结，
+
+native->通过request传递buffer->hal层 enq->Isp->Isp返回帧-> hal层 deq->hal ret？->native层回收buffer
+
+在buffer轮转流程分析里多次出现surface和ANativeWindow等概念，接下来具体分析
+
+在创建surface时，有如下流程
+
+```c++
+binder::Status CameraDeviceClient::createSurfaceFromGbp(
+        OutputStreamInfo& streamInfo, bool isStreamInfoValid,
+  sp<Surface>& surface, const sp<IGraphicBufferProducer>& gbp) {
+	surface = new Surface(gbp, useAsync);
+	ANativeWindow *anw = surface.get();
+}
+```
+
+通过Surface定义来看一下这里转化的是什么Surface.h
+
+```c++
+//An implementation of ANativeWindow that feeds graphics buffers into a BufferQueue.
+class Surface
+    : public ANativeObjectBase<ANativeWindow, Surface, RefBase>
+{}
+```
+
+通过注释知道，所谓Surface是能够将buffer和BufferQueue联系起来的一种ANativeWindow的实现
+
+继续跟踪它的后续传递
+
+```c++
+binder::Status CameraDeviceClient::createStream(
+        const hardware::camera2::params::OutputConfiguration &outputConfiguration,
+      			int32_t* newStreamId) {
+  for (auto& bufferProducer : bufferProducers) {
+    sp<Surface> surface;
+    res = createSurfaceFromGbp(streamInfo, isStreamInfoValid, surface, bufferProducer);
+    surfaces.push_back(surface);
+  }
+  int streamId = camera3::CAMERA3_STREAM_ID_INVALID;
+  std::vector<int> surfaceIds;
+  err = mDevice->createStream(surfaces, deferredConsumer, streamInfo.width,
+            streamInfo.height, streamInfo.format, streamInfo.dataSpace,
+            static_cast<camera3_stream_rotation_t>(outputConfiguration.getRotation()),
+            &streamId, physicalCameraId, &surfaceIds, outputConfiguration.getSurfaceSetID(),
+            isShared);
+}
+```
+
+可以看到这里创建的Surface作为createSurfaceFromGbp的出参返回，被添加到vector中，再做为mDevice->createStream的参数去创建流，继续往下追
+
+```c++
+status_t Camera3Device::createStream(const std::vector<sp<Surface>>& consumers,
+        bool hasDeferredConsumer, uint32_t width, uint32_t height, int format,
+        android_dataspace dataSpace, camera3_stream_rotation_t rotation, int *id,
+        const String8& physicalCameraId,
+		std::vector<int> *surfaceIds, int streamSetId, bool isShared, uint64_t consumerUsage) {
+	 newStream = new Camera3OutputStream(mNextStreamId, consumers[0],
+                width, height, blobBufferSize, format, dataSpace, rotation,
+                mTimestampOffset, physicalCameraId, streamSetId);
+}
+
+Camera3OutputStream::Camera3OutputStream(int id,
+        sp<Surface> consumer,
+        uint32_t width, uint32_t height, int format,
+        android_dataspace dataSpace, camera3_stream_rotation_t rotation,
+        nsecs_t timestampOffset, const String8& physicalCameraId,
+        int setId) :
+        Camera3IOStreamBase(id, CAMERA3_STREAM_OUTPUT, width, height,
+                            /*maxSize*/0, format, dataSpace, rotation,
+                            physicalCameraId, setId),
+        mConsumer(consumer), ...{}
+```
+
+可见最终作为Camera3OutputStream的mConsumer成员进行管理，这也符合之前分析总结的，stream是用于进行管理的概念。
+
+前面分析的配置流时调用了view系统的接口
+
+```c++
+status_t Camera3OutputStream::configureConsumerQueueLocked() {
+	res = mConsumer->connect(NATIVE_WINDOW_API_CAMERA, mBufferReleasedListener, true);
+	res = native_window_set_buffer_count(mConsumer.get(), mTotalBufferCount);//①
+}
+```
+
+接下来详细分析这段逻辑
+
+首先看Surface的connect方法,mConsumer->connect
+
+```c++
+int Surface::connect(int api, const sp<IProducerListener>& listener, bool reportBufferRemoval) {
+	IGraphicBufferProducer::QueueBufferOutput output;
+    mReportRemovedBuffers = reportBufferRemoval;
+    int err = mGraphicBufferProducer->connect(listener, api, mProducerControlledByApp, &output);
+	if (err == NO_ERROR) {
+    	mDefaultWidth = output.width;
+        mDefaultHeight = output.height;
+        mNextFrameNumber = output.nextFrameNumber;
+        if (mStickyTransform == 0) {
+            mTransformHint = output.transformHint;
+        }
+        mConsumerRunningBehind = (output.numPendingBuffers >= 2);
+  }
+}
+```
+
+ 这里的mGraphicBufferProducer就是从apk传下来的bgp，这里的实际类是BufferQueueProducer
+
+```c++
+status_t BufferQueueProducer::connect(const sp<IProducerListener>& listener,
+						int api, bool producerControlledByApp, QueueBufferOutput *output) {
+  switch (api) {
+      case NATIVE_WINDOW_API_CAMERA:
+            mCore->mConnectedApi = api;
+            output->width = mCore->mDefaultWidth;
+            output->height = mCore->mDefaultHeight;
+            output->transformHint = mCore->mTransformHint;
+  }  
+}
+```
+
+可以看到所谓的connect只是对QueueBufferOutput进行了设置，并返回给Surface进行参数设置，①再看native_window_set_buffer_count，它是一系列native_window_set_xxx中的一个，定义在window.h中
+
+```c++
+tatic inline int native_window_set_buffer_count(struct ANativeWindow* window,size_t bufferCount)
+{
+    return window->perform(window, NATIVE_WINDOW_SET_BUFFER_COUNT, bufferCount);
+}
+```
+
+这里的perform是定义在Surface.cpp中的钩子，后面是一系列调用
+
+```c++
+Surface::Surface(const sp<IGraphicBufferProducer>& bufferProducer, bool controlledByApp)...
+{
+	ANativeWindow::setSwapInterval  = hook_setSwapInterval;
+    ANativeWindow::dequeueBuffer    = hook_dequeueBuffer;
+    ANativeWindow::cancelBuffer     = hook_cancelBuffer;
+    ANativeWindow::queueBuffer      = hook_queueBuffer;
+    ANativeWindow::query            = hook_query;
+    ANativeWindow::perform          = hook_perform;
+}
+int Surface::hook_perform(ANativeWindow* window, int operation, ...) {
+    va_list args;
+    va_start(args, operation);
+    Surface* c = getSelf(window);
+    int result = c->perform(operation, args);
+    va_end(args);
+    return result;
+}
+
+int Surface::perform(int operation, va_list args){
+  switch (operation) {
+      case NATIVE_WINDOW_SET_BUFFER_COUNT:
+        res = dispatchSetBufferCount(args);
+        break;
+  }
+}
+int Surface::dispatchSetBufferCount(va_list args) {
+    size_t bufferCount = va_arg(args, size_t);
+    return setBufferCount(static_cast<int32_t>(bufferCount));
+}
+int Surface::setBufferCount(int bufferCount){
+   status_t err = NO_ERROR;
+    if (bufferCount == 0) {
+        err = mGraphicBufferProducer->setMaxDequeuedBufferCount(1);
+    } else {
+        int minUndequeuedBuffers = 0;
+        err = mGraphicBufferProducer->query(
+                NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS, &minUndequeuedBuffers);
+        if (err == NO_ERROR) {
+            err = mGraphicBufferProducer->setMaxDequeuedBufferCount(
+                    bufferCount - minUndequeuedBuffers);
+        }
+    }
+}
+```
+
+这里只是设置了一些参数，还不是没有申请buffer，申请buffer需要从view系统的显示侧说起，在view设置中通过
+
+一系列调用，走到ViewRootImpl.java中的
+
+```java
+void doTraversal() {
+  if (mTraversalScheduled) {
+    performTraversals();
+  }
+}
+
+private void performTraversals() {
+	if (mAttachInfo.mThreadedRenderer != null) {
+		try {
+			hwInitialized = mAttachInfo.mThreadedRenderer.initialize(mSurface);
+          	 if (hwInitialized && (host.mPrivateFlags
+                                        & View.PFLAG_REQUEST_TRANSPARENT_REGIONS) == 0) {
+				mSurface.allocateBuffers();
+             }
+        } catch (OutOfResourcesException e) {
+			handleOutOfResourcesException(e);
+			return;
+        }
+    } 
+}
+```
+
+performTraversals这个函数非常复杂，这里只关注surface分配buffer部分，可以看到这里是lazyinit，只有当surface趋势需要显示时，才会调用接口去分配buffer，其实现在Surface.java
+
+```java
+public void allocateBuffers() {
+	synchronized (mLock) {
+		checkNotReleasedLocked();
+		nativeAllocateBuffers(mNativeObject);
+	}
+}
+```
+
+nativeAllocateBuffers定义在android_view_Surface.cpp
+
+```c++
+static void nativeAllocateBuffers(JNIEnv* /* env */ , jclass /* clazz */,jlong nativeObject) {
+  surface->allocateBuffers();
+}
+```
+
+然后依次调用
+
+```c++
+void BufferQueueProducer::allocateBuffers(uint32_t width, uint32_t height,PixelFormat format, 										uint64_t usage) {
+  while (true) {
+    Vector<sp<GraphicBuffer>> buffers;
+    for (size_t i = 0; i <  newBufferCount; ++i) {
+      sp<GraphicBuffer> graphicBuffer = new GraphicBuffer(allocWidth, allocHeight, allocFormat, 										BQ_LAYER_COUNT,allocUsage, allocName);
+			status_t result = graphicBuffer->initCheck();
+    }
+    buffers.push_back(graphicBuffer);
+  }
+}
+```
+
+直到这时才最终分配GraphicBuffer并加入到BufferQueue 中去
+
+接下来从Surface中获取buffer，传递给hal去处理，实现在
+
+```C++
+status_t Camera3OutputStream::getBufferLocked(camera3_stream_buffer *buffer,
+                                              const std::vector<size_t>&) {
+	res = getBufferLockedCommon(&anb, &fenceFd);
+  	handoutBufferLocked(*buffer, &(anb->handle), fenceFd,-1, CAMERA3_BUFFER_STATUS_OK, true);
+}
+
+status_t Camera3OutputStream::getBufferLockedCommon(ANativeWindowBuffer** anb, int* fenceFd) {
+	nsecs_t dequeueStart = systemTime(SYSTEM_TIME_MONOTONIC);
+	res = currentConsumer->dequeueBuffer(currentConsumer.get(), anb, fenceFd);
+}
+```
+
+这里currentConsumer->dequeueBuffer会先调用Surface.dequeueBuffer,进而调用BufferQueueProducer.dequeueBuffer,将可用的buffer返回待用，再向后就是buffer轮转，最终返回给Surface去实现显示的流程，
+
+## 拍照
+
+拍照流程很多和预览流程有很多相似之处，可以类比分析，拍照流程主要时通过CameraCaptureSession.CaptureCallback 这个回调处理的，实现拍照让然是通过下发request的方式实现的，
+
+#### 1 native java流程
+
+先来分析capture，该方法定义在CameraCaptureSessionImpl中
+
+```java
+public int capture(CaptureRequest request, CaptureCallback callback,Handler handler){
+  return addPendingSequence(mDeviceImpl.capture(request,
+						createCaptureCallbackProxy(handler, callback), mDeviceExecutor));
+}
+```
+
+这里的结构和setRepeatingRequest一模一样，只是添加的id改为从mDeviceImpl.capture返回的，它实现CameraDeviceImpl
+
+```java
+public int capture(CaptureRequest request, CaptureCallback callback, Executor executor){
+	return submitCaptureRequest(requestList, callback, executor, /*streaming*/false);
+}
+
+private int submitCaptureRequest(List<CaptureRequest> requestList, CaptureCallback callback, 								Executor executor, boolean repeating){
+	CaptureRequest[] requestArray = 
+      					requestList.toArray(new CaptureRequest[requestList.size()]);
+	requestInfo = mRemoteDevice.submitRequestList(requestArray, repeating);
+}
+```
+
+这里也与预览时一致，唯一的区别在于此时的repeating=false，接下来就进入native C++流程
+
+#### 2.native c++
+
+mRemoteDevice.submitRequestList
+
+```c++
+binder::Status CameraDeviceClient::submitRequestList(
+        const std::vector<hardware::camera2::CaptureRequest>& requests,bool streaming,
+  		hardware::camera2::utils::SubmitInfo *submitInfo) {
+	if (streaming) {
+        err = mDevice->setStreamingRequestList(metadataRequestList, surfaceMapList,
+				&(submitInfo->mLastFrameNumber));
+    }else{
+      err = mDevice->captureList(metadataRequestList, surfaceMapList,
+                                 &(submitInfo->mLastFrameNumber));
+    }
+}
+```
+
+继续往下走到
+
+```c++
+status_t Camera3Device::submitRequestsHelper(){
+	res = mRequestThread->queueRequestList(requestList, lastFrameNumber);
+}
+status_t Camera3Device::RequestThread::queueRequestList(){
+	for (List<sp<CaptureRequest> >::iterator it = requests.begin(); it != requests.end();++it){
+	mRequestQueue.push_back(*it);
+    }
+  	unpauseForNewRequests();
+}
+```
+
+这里和预览有区别，request不是添加到mRepeatingRequests ，而是添加到mRequestQueue中
+
+request生效逻辑也类似预览，回顾前面Threadloop分析时，提到的waitForNextRequestLocked
+
+```c++
+sp<Camera3Device::CaptureRequest>Camera3Device::RequestThread::waitForNextRequestLocked() {
+	sp<CaptureRequest> nextRequest;
+  	while (mRequestQueue.empty()) {}
+  if (nextRequest == NULL) {
+    RequestList::iterator firstRequest = mRequestQueue.begin();
+    nextRequest = *firstRequest;
+	mRequestQueue.erase(firstRequest);
+  }
+}
+```
+
+由于capture request，while的条件不成立，nextRequest为空，此时nextRequest就是capture request，可见capture request优先级比repeating request高，会插队处理。
+
+后续逻辑和预览一致，也是通过buffer传递，将拍摄的照片返回给surface，只是此时的surface是ImageReader.getsurface。它的主要特点是可以通过setOnImageAvailableListener，在buffer返回之后进行保存等操作。
