@@ -1,0 +1,407 @@
+### 2. 设置request
+
+在创建好session和stream后，通过调用setRepeatingRequest，下发预览的request，启动预览，
+
+#### 2.1native java层
+
+setRepeatingRequest在CameraCaptureSession.java中是抽象函数，实际CameraCaptureSessionImpl.java中实现
+
+```java
+public int setRepeatingRequest(CaptureRequest request, CaptureCallback callback,
+								Handler handler) throws CameraAccessException {
+	synchronized (mDeviceImpl.mInterfaceLock) {
+		return addPendingSequence(mDeviceImpl.setRepeatingRequest(request,
+                    createCaptureCallbackProxy(handler, callback), mDeviceExecutor));
+	}
+}
+```
+
+addPendingSequencem不需要关注，分析DeviceImpl.setRepeatingRequest，在CameraDeviceImpl.java中实现，
+
+```java
+public int setRepeatingRequest(CaptureRequest request, CaptureCallback callback,
+                               Executor executor) throws CameraAccessException {
+        List<CaptureRequest> requestList = new ArrayList<CaptureRequest>();
+        requestList.add(request);
+        return submitCaptureRequest(requestList, callback, executor, /*streaming*/true);
+}
+
+private int submitCaptureRequest(List<CaptureRequest> requestList, CaptureCallback callback,
+                                 Executor executor, boolean repeating) {
+  synchronized(mInterfaceLock) {
+    CaptureRequest[] requestArray = requestList.toArray(new CaptureRequest[requestList.size()]);
+    requestInfo = mRemoteDevice.submitRequestList(requestArray, repeating);
+  }
+}
+```
+
+可以看到调用了mRemoteDevice.submitRequestList，这个时AIDL调用，对应代码在CameraDeviceClient.cpp，进入native C++流程
+
+#### 2.2 native c++层
+
+mRemoteDevice.submitRequestList的实现
+
+```c++
+binder::Status CameraDeviceClient::submitRequestList(
+        const std::vector<hardware::camera2::CaptureRequest>& requests,
+        bool streaming,
+        /*out*/
+  hardware::camera2::utils::SubmitInfo *submitInfo) {
+  if (streaming) {
+	err = mDevice->setStreamingRequestList(metadataRequestList, surfaceMapList,
+					&(submitInfo->mLastFrameNumber));
+  } else {
+	err = mDevice->captureList(metadataRequestList, surfaceMapList,
+                &(submitInfo->mLastFrameNumber));
+  }
+}
+```
+
+这个函数异常复杂，大多都是异常判断，其中日志对定位问题很有帮助，先不关注，只关注主干流程，对于预览，streaming为true，调用mDevice->setStreamingRequestList，实现在Camera3Device.cpp中
+
+```c++
+status_t Camera3Device::setStreamingRequestList(
+		const List<const PhysicalCameraSettingsList> &requestsList,
+  		const std::list<const SurfaceMap> &surfaceMaps, int64_t *lastFrameNumber) {
+	return submitRequestsHelper(requestsList, surfaceMaps, /*repeating*/true, lastFrameNumber);
+}
+
+status_t Camera3Device::submitRequestsHelper(
+        const List<const PhysicalCameraSettingsList> &requests,
+        const std::list<const SurfaceMap> &surfaceMaps,
+        bool repeating,
+  		int64_t *lastFrameNumber) {
+	RequestList requestList;
+	res = convertMetadataListToRequestListLocked(requests, surfaceMaps,repeating,&requestList);
+	if (repeating) {
+		res = mRequestThread->setRepeatingRequests(requestList, lastFrameNumber);
+	} else {
+		res = mRequestThread->queueRequestList(requestList, lastFrameNumber);
+	}
+}
+```
+
+这里主要有两步，第一步convertMetadataListToRequestListLocked创建request并返回，第二步是通知mRequestThread进行预览请求的设置，实现都是在Camera3Device.cpp，先看第一步
+
+```c++
+status_t Camera3Device::convertMetadataListToRequestListLocked(
+        const List<const PhysicalCameraSettingsList> &metadataList,
+        const std::list<const SurfaceMap> &surfaceMaps,bool repeating,RequestList *requestList) {
+	int32_t burstId = 0;
+	List<const PhysicalCameraSettingsList>::const_iterator metadataIt = metadataList.begin();
+	std::list<const SurfaceMap>::const_iterator surfaceMapIt = surfaceMaps.begin();
+	for (; metadataIt != metadataList.end() && surfaceMapIt != surfaceMaps.end();
+                           ++metadataIt, ++surfaceMapIt) {
+		sp<CaptureRequest> newRequest = setUpRequestLocked(*metadataIt, *surfaceMapIt);
+		newRequest->mRepeating = repeating;
+		requestList->push_back(newRequest);
+    }
+}
+```
+
+setUpRequestLocked主要就是将metadata转化为request
+
+接下来看第二步mRequestThread->setRepeatingRequests
+
+```c++
+status_t Camera3Device::RequestThread::setRepeatingRequests(const RequestList &requests,
+                                                            int64_t *lastFrameNumber) {
+	mRepeatingRequests.clear();
+	mRepeatingRequests.insert(mRepeatingRequests.begin(),requests.begin(), requests.end());
+}
+```
+
+这里只是将request添加到成员mRepeatingRequests中，接下来通过分析RequestThread的前世今生，来看看request的是如何生效的，首先看RequestThread是何时创建的
+
+```c++
+status_t Camera3Device::initialize(sp<CameraProviderManager> manager, 
+                                   const String8& monitorTags) {
+	sp<ICameraDeviceSession> session;
+	mInterface = new HalInterface(session, queue);
+	std::string providerType;
+	mVendorTagId = manager->getProviderTagIdLocked(mId.string());
+	mTagMonitor.initialize(mVendorTagId);
+	return initializeCommonLocked();
+}
+status_t Camera3Device::initializeCommonLocked() {
+	mBufferManager = new Camera3BufferManager();
+ 	mRequestThread = new RequestThread(this, mStatusTracker, mInterface, sessionParamKeys);
+	res = mRequestThread->run(String8::format("C3Dev-%s-ReqQueue", mId.string()).string());
+}
+```
+
+到这里看出RequestThread是在Camera3Device::initializeCommonLocked创建调用的，在这里创建线程并run，在执行run后，会反复调用Thread对应的threadLoop方法
+
+```c++
+bool Camera3Device::RequestThread::threadLoop() {
+	waitForNextRequestBatch();
+	res = prepareHalRequests();//①
+	bool submitRequestSuccess = false;
+    nsecs_t tRequestStart = systemTime(SYSTEM_TIME_MONOTONIC);
+    if (mInterface->supportBatchRequest()) {
+        submitRequestSuccess = sendRequestsBatch();//②
+    } else {
+        submitRequestSuccess = sendRequestsOneByOne();
+    }
+	return submitRequestSuccess;
+}
+```
+
+这里是buffer轮转相关的处理，（batch：设置camera的参数）继续展开
+
+```c++
+void Camera3Device::RequestThread::waitForNextRequestBatch() {
+	NextRequest nextRequest;
+	nextRequest.captureRequest = waitForNextRequestLocked();
+	nextRequest.halRequest = camera3_capture_request_t();
+	nextRequest.submitted = false;
+	mNextRequests.add(nextRequest);
+	const size_t batchSize = nextRequest.captureRequest->mBatchSize;
+	for (size_t i = 1; i < batchSize; i++) {
+        NextRequest additionalRequest;
+        additionalRequest.captureRequest = waitForNextRequestLocked();
+        if (additionalRequest.captureRequest == nullptr) {
+            break;
+        }
+        additionalRequest.halRequest = camera3_capture_request_t();
+        additionalRequest.submitted = false;
+        mNextRequests.add(additionalRequest);
+    }
+}
+
+sp<Camera3Device::CaptureRequest> Camera3Device::RequestThread::waitForNextRequestLocked() {
+    status_t res;
+    sp<CaptureRequest> nextRequest;
+    while (mRequestQueue.empty()) {
+        if (!mRepeatingRequests.empty()) {
+            const RequestList &requests = mRepeatingRequests;
+            RequestList::const_iterator firstRequest = requests.begin();
+            nextRequest = *firstRequest;
+            mRequestQueue.insert(mRequestQueue.end(),
+                    ++firstRequest,
+                    requests.end());
+            mRepeatingLastFrameNumber = mFrameNumber + requests.size() - 1;
+            break;
+        }
+    }
+  return nextRequest;
+}
+```
+
+在waitForNextRequestLocked中只关注预览请求mRepeatingRequests，当存在预览请求时，总是把预览请求加入到请求队列中，这也是他被称为RepeatingRequest的原因，①准备好nextRequest后，执行prepareHalRequests
+
+```c++
+status_t Camera3Device::RequestThread::prepareHalRequests() {
+	for (size_t i = 0; i < mNextRequests.size(); i++) {
+		auto& nextRequest = mNextRequests.editItemAt(i);
+		sp<CaptureRequest> captureRequest = nextRequest.captureRequest;
+		camera3_capture_request_t* halRequest = &nextRequest.halRequest;
+		Vector<camera3_stream_buffer_t>* outputBuffers = &nextRequest.outputBuffers;
+		halRequest->frame_number = captureRequest->mResultExtras.frameNumber;
+		outputBuffers->insertAt(camera3_stream_buffer_t(), 0,
+								captureRequest->mOutputStreams.size());
+		halRequest->output_buffers = outputBuffers->array();
+		for (size_t j = 0; j < captureRequest->mOutputStreams.size(); j++) {
+			sp<Camera3OutputStreamInterface> outputStream = 
+								captureRequest->mOutputStreams.editItemAt(j);
+			res = outputStream->getBuffer(&outputBuffers->editItemAt(j),
+										captureRequest->mOutputSurfaces[j]);
+			halRequest->num_output_buffers++;
+		}
+		totalNumBuffers += halRequest->num_output_buffers;
+	} 
+}
+```
+
+这个函数异常复杂，略去主流程不相关部分不分析，只关注给halRequest提供的buffer来源，即
+
+outputStream->getBuffer，实现在Camera3Stream.cpp 中
+
+```c++
+status_t Camera3Stream::getBuffer(camera3_stream_buffer *buffer,
+                                  const std::vector<size_t>& surface_ids) {
+  if (getHandoutOutputBufferCountLocked() == camera3_stream::max_buffers) {
+    nsecs_t waitStart = systemTime(SYSTEM_TIME_MONOTONIC);
+    res = mOutputBufferReturnedSignal.waitRelative(mLock, kWaitForBufferDuration);
+  }
+  res = getBufferLocked(buffer, surface_ids);
+}
+```
+
+这里出现一个比较常见的日志Already dequeued max output buffers，这是正常流程的日志，当没有可用buffer时会进行等待，再往下分析getBufferLocked，如前面分析这里时子类对象所以调用的是子类的方法，定义在Camera3OutputStream.cpp中
+
+```c++
+status_t Camera3OutputStream::getBufferLocked(camera3_stream_buffer *buffer,
+                                              const std::vector<size_t>&) {
+	ANativeWindowBuffer* anb;
+    int fenceFd = -1;
+    status_t res;
+    res = getBufferLockedCommon(&anb, &fenceFd);
+  	handoutBufferLocked(*buffer, &(anb->handle), fenceFd,-1, CAMERA3_BUFFER_STATUS_OK, true);
+}
+
+status_t Camera3OutputStream::getBufferLockedCommon(ANativeWindowBuffer** anb, int* fenceFd) {
+	if (!gotBufferFromManager) {
+		sp<ANativeWindow> currentConsumer = mConsumer;
+		mLock.unlock();
+		nsecs_t dequeueStart = systemTime(SYSTEM_TIME_MONOTONIC);
+		res = currentConsumer->dequeueBuffer(currentConsumer.get(), anb, fenceFd);
+		nsecs_t dequeueEnd = systemTime(SYSTEM_TIME_MONOTONIC);
+		mDequeueBufferLatency.add(dequeueStart, dequeueEnd);
+		mLock.lock();
+	}
+}
+```
+
+这里的mConsumer是Surface对象，可见buffer是从view系统分配出来的，view相关的单独分析，先简单理解为从buffer队列中取一个buffer，并封装成halRequest，做完这一步之后，发送request，调用sendRequestsBatch或sendRequestsOneByOne，这两个函数流程类似，以sendRequestsBatch为例分析
+
+```c++
+bool Camera3Device::RequestThread::sendRequestsBatch() {
+  	for (size_t i = 0; i < batchSize; i++) {
+        requests[i] = &mNextRequests.editItemAt(i).halRequest;
+    }
+	res = mInterface->processBatchCaptureRequests(requests, &numRequestProcessed);
+}
+```
+
+这里调用了mInterface->processBatchCaptureRequests
+
+```c++
+status_t Camera3Device::HalInterface::processBatchCaptureRequests(
+  std::vector<camera3_capture_request_t*>& requests,/*out*/uint32_t* numRequestProcessed) {
+	 err = mHidlSession->processCaptureRequest(captureRequests, cachesToRemove,
+            [&status, &numRequestProcessed] (auto s, uint32_t n) {
+				status = s;
+				*numRequestProcessed = n;
+            });  
+}
+```
+
+最终调用hal层接口处理request，接下来分析hal层
+
+#### 2.3 hal层
+
+HIDL调用mHidlSession->processCaptureRequest定义在CameraDeviceSession.cpp中
+
+```c++
+Return<void> CameraDeviceSession::processCaptureRequest(
+        const hidl_vec<CaptureRequest>& requests,
+        const hidl_vec<BufferCache>& cachesToRemove,
+  ICameraDeviceSession::processCaptureRequest_cb _hidl_cb)  {
+	for (size_t i = 0; i < requests.size(); i++, numRequestProcessed++) {
+        s = processOneCaptureRequest(requests[i]);
+    }
+}
+Status CameraDeviceSession::processOneCaptureRequest(const CaptureRequest& request)  {
+	camera3_capture_request_t halRequest;
+ 	status_t ret = mDevice->ops->process_capture_request(mDevice, &halRequest);
+}
+```
+
+这里调用processOneCaptureRequest，然后依次
+
+```c++
+int Camera::processCaptureRequest(camera3_capture_request_t *temp_request)
+{
+	for (auto& output_buffer : request->output_buffers) {
+		res = preprocessCaptureBuffer(&output_buffer);
+	}
+}
+```
+
+### 3.buffer回传和view系统 
+
+#### 3.1 hal 流程
+
+hal层接收到相应ISP返回的buffer，并回传给native层
+
+ #### 3.2 native层流程
+
+通过调用Camera3Device::processCaptureResult，返回了native层 
+
+```c++
+hardware::Return<void> Camera3Device::processCaptureResult(
+		const hardware::hidl_vec<hardware::camera::device::V3_2::CaptureResult>& results) {
+	for (const auto& result : results) {
+		processOneCaptureResultLocked(result, noPhysMetadata);
+	}
+}
+
+void Camera3Device::processOneCaptureResultLocked(
+        const hardware::camera::device::V3_2::CaptureResult& result,
+        const hardware::hidl_vec<
+  hardware::camera::device::V3_4::PhysicalCameraMetadata> physicalCameraMetadatas) {
+	processCaptureResult(&r);
+}
+
+void Camera3Device::processCaptureResult(const camera3_capture_result *result) {
+	if (shutterTimestamp == 0) {
+		request.pendingOutputBuffers.appendArray(result->output_buffers,
+                                                 result->num_output_buffers);
+	} else {
+		returnOutputBuffers(result->output_buffers,
+                            	result->num_output_buffers, shutterTimestamp);
+	}  
+}
+```
+
+然后再通过一系列调用到了Camera3Device::processCaptureResult，这个函数很复杂，对数据进行了许多处理，主要关注buffer的轮转相关部分，也就是returnOutputBuffers部分
+
+```c++
+void Camera3Device::returnOutputBuffers(
+		const camera3_stream_buffer_t *outputBuffers, size_t numBuffers,nsecs_t timestamp) {
+	for (size_t i = 0; i < numBuffers; i++){
+        Camera3Stream *stream = Camera3Stream::cast(outputBuffers[i].stream);
+        status_t res = stream->returnBuffer(outputBuffers[i], timestamp);
+    }
+}
+```
+
+继而调用Camera3Stream::returnBuffer
+
+```c++
+status_t Camera3Stream::returnBuffer(const camera3_stream_buffer &buffer,nsecs_t timestamp) {
+	status_t res = returnBufferLocked(buffer, timestamp);
+    if (res == OK) {
+        fireBufferListenersLocked(buffer, /*acquired*/false, /*output*/true);
+    }
+}
+```
+
+这里调用了子类Camera3OutputStream的对应方法returnBufferLocked函数
+
+```c++
+status_t Camera3OutputStream::returnBufferLocked(
+        const camera3_stream_buffer &buffer, nsecs_t timestamp) {
+	status_t res = returnAnyBufferLocked(buffer, timestamp, /*output*/true);
+}
+```
+
+这里调用到子类Camera3IOStreamBase的returnAnyBufferLocked方法
+
+```c++
+status_t Camera3IOStreamBase::returnAnyBufferLocked(const camera3_stream_buffer &buffer,
+                                                    nsecs_t timestamp, bool output) {
+	sp<Fence> releaseFence;
+	res = returnBufferCheckedLocked(buffer, timestamp, output, &releaseFence);
+}
+```
+
+这里又调用回父类，调用了父类的returnBufferCheckedLocked方法
+
+```c++
+status_t Camera3OutputStream::returnBufferCheckedLocked(const camera3_stream_buffer &buffer,
+								nsecs_t timestamp, bool output, sp<Fence> *releaseFenceOut) {
+	ANativeWindowBuffer *anwBuffer = container_of(buffer.buffer, ANativeWindowBuffer, handl);
+	if (buffer.status == CAMERA3_BUFFER_STATUS_ERROR || mDropBuffers) {
+		res = queueBufferToConsumer(currentConsumer, anwBuffer, anwReleaseFence);
+	}	  
+}
+
+status_t Camera3OutputStream::queueBufferToConsumer(sp<ANativeWindow>& consumer,
+            ANativeWindowBuffer* buffer, int anwReleaseFence) {
+    return consumer->queueBuffer(consumer.get(), buffer, anwReleaseFence);
+}
+```
+
+最终通过调用ANativeWindowBuffer的queueBuffer方法，将buffer返回队列中，至此buffer的轮转流程完成
